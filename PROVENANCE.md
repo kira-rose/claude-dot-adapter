@@ -1,8 +1,10 @@
 # Provenance and rights notice
 
-Version **0.2.0**, prepared 22 October 2026.
+Version **0.3.0 candidate**, prepared 22 October 2026.
 
 This maintained package continues the original local adapter implementation developed during the requesting user's Codex task. Its starting Python sources were the sanitized `0.1.0-review.3` review distribution (`adapter.py`, `client.py`, `test_adapter.py`). This version adds the durable workflow/journal, bounded stream-aware observation, explicit transcript gaps and offline regression tests.
+
+The 0.3.0 candidate adds a bounded receive-only collector, a separate event journal/status lane, optional pipe output, and a documented host integration boundary. It is developed on a feature branch while the qualified 0.2.0 source and installation remain separate. No live Claude probes were sent for the new collector; synthetic socket and process fixtures do not establish live peer publication or parent wake-up acceptance.
 
 Documentation in this repository was written for this package from its implementation and authorized operating requirements. The earlier operational companion and its organization-specific skill text are not included. No vendor runtime implementation, SDK, credentials, user configuration, real transcript, private session identity, installation path or live integration receipt is bundled. Tests use synthetic fixtures. Product names describe interoperability and do not imply vendor affiliation or endorsement.
 

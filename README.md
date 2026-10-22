@@ -2,14 +2,17 @@
 
 A local adapter that lets a Codex session observe and send peer messages to one explicitly selected, already running Claude Code session. It connects directly through Claude Code's local Unix socket and visible transcript; no Decodex service is required.
 
-Version **0.2.0**. Python standard library only. The protocol guard accepts **Claude Code 2.1.299 / peer protocol 1**. Other versions fail closed until separately verified. macOS and Linux peer identity checks are implemented; Windows is unsupported. The current release has offline validation, not a fresh live-session acceptance result.
+Version **0.3.0 candidate**. Python standard library only. The protocol guard accepts **Claude Code 2.1.299 / peer protocol 1**. Other versions fail closed until separately verified. macOS and Linux peer identity checks are implemented; Windows is unsupported. The new collector has offline validation only. It has no qualified route for waking an existing Codex chat.
 
-## Two entry points
+## Entry points
 
 | Entry point | Purpose | Lifetime and persistence |
 | --- | --- | --- |
-| `adapter.py` | Four MCP tools: list, read, send, wait | One target per helper; peer events and send tracking are in memory |
+| `adapter.py` | Five MCP tools: list, read, send, wait, open receive-only inbox | One target per helper; peer events and send tracking are in memory |
 | `client.py` | Single send followed by repeated bounded observation | One helper per invocation; private SQLite intent, evidence and cursors survive invocation exit |
+| `collector.py` | Receive-only collection, status, replay and optional pipe publication | Foreground bounded run; a separate private event journal and consumer cursors survive exit |
+
+The collector observes assistant transcript events without an outstanding send. Opting into `--peer-inbox` also opens an ephemeral Unix inbox for unsolicited messages from the same verified target process. It does not announce the address, dispatch work or wake a parent. See [bidirectional.md](bidirectional.md) for usage and [host-integration.md](host-integration.md) for the precise missing host contract.
 
 Use the client workflow when the operation must remain identifiable after a crash. It commits an operation ID before sending and never sends that ID again, even if the helper exits before returning a message ID. Retain the same state directory and operation ID to preserve this guarantee. Direct MCP sends do not use the durable journal.
 
@@ -17,7 +20,7 @@ The adapter does not start/resume Claude, change its settings, answer approvals 
 
 ## Run the client
 
-Requires Python 3.10 or newer, an absolute path to the verified Claude executable, and the exact authorized session UUID. Keep the four Python implementation files together. Run these examples from the repository directory, replacing the placeholders with your authorized values:
+Requires Python 3.10 or newer, an absolute path to the verified Claude executable, and the exact authorized session UUID. Keep the Python implementation files together. Run these examples from the repository directory, replacing the placeholders with your authorized values:
 
 ```sh
 python3 -B client.py --cli /absolute/path/to/claude \
@@ -88,7 +91,7 @@ Transcript reads scan at most 256 KiB, return at most 100 events and cap visible
 
 Peer events have a separate helper-specific stream and sequence. The in-memory buffer retains 200 events and reports retention gaps. A new helper cannot replay an old stream. The journal atomically commits observed evidence with its cursors; it cannot recover events never observed. It holds at most 128 operations and 5,000 events, with a 256 KiB bound per stored JSON value. Capacity errors preserve the last committed cursor and do not silently prune deduplication state. Do not delete or replace a journal to retry an uncertain operation.
 
-This is caller-driven bounded observation. It provides no daemon, subscription callback, automatic wake-up or background delivery to a disconnected Codex chat. Local output and state can contain private conversation text and paths: retain them privately and exclude them from source control.
+The original client workflow is caller-driven bounded observation. The separate collector can remain active for its explicit foreground budget and publish newly committed envelopes to a connected pipe. Neither path provides a daemon or automatic wake-up/delivery to a disconnected Codex chat. Local output and state can contain private conversation metadata and paths: retain them privately and exclude them from source control.
 
 ## Validation and maintenance
 

@@ -214,7 +214,7 @@ class AdapterTests(unittest.TestCase):
         for tool in mod.tool_specs():
             with self.subTest(tool=tool["name"]):
                 sending = tool["name"] == "send_claude_message"
-                self.assertEqual(not sending, tool["annotations"]["readOnlyHint"])
+                self.assertEqual(tool["name"] not in ("send_claude_message", "open_claude_inbox"), tool["annotations"]["readOnlyHint"])
                 self.assertEqual(sending, tool["annotations"]["destructiveHint"])
                 self.assertEqual(sending, tool["annotations"]["openWorldHint"])
 

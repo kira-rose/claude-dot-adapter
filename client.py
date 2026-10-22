@@ -38,7 +38,7 @@ class Client:
         try:
             self._configure_transport()
             self.request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
-                         "clientInfo": {"name": "claude-adapter-client", "version": "0.2.0"}})
+                         "clientInfo": {"name": "claude-adapter-client", "version": "0.3.0"}})
             self._write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode() + b"\n",
                         time.monotonic() + self.timeout, self.cancel)
         except BaseException:
