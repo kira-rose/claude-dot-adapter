@@ -489,5 +489,70 @@ class ReceiveOnlyInboxTests(unittest.TestCase):
         self.assertEqual("session_not_allowed", error.exception.code)
 
 
+class CollectorDiscardRestartTests(unittest.TestCase):
+    setUp = fixture.AdapterTests.setUp
+    tearDown = fixture.AdapterTests.tearDown
+    cursor = fixture.AdapterTests.cursor
+
+    def test_committed_discard_cursor_survives_disconnect_and_reopen(self):
+        body = fixture.line({"type": "user", "sessionId": TARGET,
+                             "message": {"content": [{"type": "tool_result", "content": "HIDDEN_TOOL_BODY" * 70000}]}})
+        self.transcript.write_bytes(body + fixture.line(fixture.event("VISIBLE_AFTER")))
+        state_path = self.root / "collector-state"
+        state_path.mkdir(mode=0o700)
+        binding = {**BINDING, "include_text": True}
+        owner = self
+
+        class Bridge:
+            def __init__(self, fail):
+                self.fail = fail
+                self.closed = False
+                self.calls = []
+
+            def call(self, name, args, **_):
+                self.calls.append(name)
+                if name not in ("read_claude_session", "wait_claude_session"):
+                    raise AssertionError("No sends or inbox permitted in this fixture")
+                if name == "wait_claude_session" and self.fail:
+                    raise RuntimeError("synthetic disconnect")
+                args = dict(args)
+                if name == "wait_claude_session":
+                    args["timeout"] = 0
+                with mock.patch.object(owner.adapter, "verify_target", return_value=owner.data):
+                    result = owner.adapter.call(name, args)
+                if name == "wait_claude_session" and not result["transcript"]["has_more"]:
+                    result["cancelled"] = True
+                return result
+
+            def close(self):
+                self.closed = True
+
+        with Store(state_path) as store:
+            state = store.bind(binding, list(self.adapter.identity(self.data)))
+            state["cursor"] = self.cursor()
+            store.commit(state)
+            first = Bridge(True)
+            failed = collector.collect(lambda: first, store, binding)
+            self.assertEqual("producer_or_transport_error", failed["outcome"])
+            saved = store.state()["cursor"]
+            self.assertTrue(saved["discarding"])
+            self.assertEqual(fixture.mod.MAX_SCAN, saved["offset"])
+        self.adapter.close()
+        self.adapter = fixture.mod.Adapter(self.root, sys.executable, TARGET, fixture.SOURCE)
+        with Store(state_path) as store:
+            self.assertEqual(saved, store.state()["cursor"])
+            second = Bridge(False)
+            result = collector.collect(lambda: second, store, binding)
+            rows = store.replay()
+            visible = [r for r in rows if r["event"]["kind"] == "assistant_message"]
+            self.assertEqual(["VISIBLE_AFTER"], [r["event"]["content"]["text"] for r in visible])
+            self.assertNotIn("HIDDEN_TOOL_BODY", json.dumps(rows))
+            self.assertEqual(self.transcript.stat().st_size, result["state"]["cursor"]["offset"])
+            self.assertNotIn("discarding", result["state"]["cursor"])
+            self.assertGreaterEqual(sum(r["event"]["kind"] == "transcript_gap" for r in rows), 2)
+            self.assertTrue(first.closed and second.closed)
+            self.assertNotIn("send_claude_message", first.calls + second.calls)
+
+
 if __name__ == "__main__":
     unittest.main()

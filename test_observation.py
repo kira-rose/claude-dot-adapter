@@ -45,6 +45,38 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(["later"], [e["text"] for e in second["events"]])
         self.assertTrue(second["gaps"])
 
+    def test_hidden_oversized_tool_body_advances_across_budget_boundary(self):
+        prefix = fixture.line({"type": "system", "padding": "x" * (mod.MAX_SCAN - 70)})
+        hidden = fixture.line({"type": "user", "sessionId": fixture.TARGET,
+                               "message": {"content": [{"type": "tool_result", "content": "HIDDEN_TOOL_BODY" * 70000}]}})
+        self.transcript.write_bytes(prefix + hidden + fixture.line(fixture.event("VISIBLE_AFTER")))
+        cursor, found, gaps = self.cursor(), [], []
+        for _ in range(8):
+            result = self.read(cursor=cursor)
+            self.assertLessEqual(result["bytes_scanned"], mod.MAX_SCAN)
+            self.assertGreater(result["cursor"]["offset"], cursor["offset"])
+            self.assertNotIn("HIDDEN_TOOL_BODY", json.dumps(result))
+            found.extend(e["text"] for e in result["events"])
+            gaps.extend(result["gaps"])
+            cursor = result["cursor"]
+            if not result["has_more"]:
+                break
+        self.assertEqual(["VISIBLE_AFTER"], found)
+        self.assertEqual(self.transcript.stat().st_size, cursor["offset"])
+        self.assertTrue(gaps)
+
+    def test_discarded_continuation_cannot_masquerade_as_visible_json(self):
+        self.transcript.write_bytes(b"x" * mod.MAX_SCAN)
+        first = self.read(cursor=self.cursor())
+        self.assertTrue(first["cursor"]["discarding"])
+        with self.transcript.open("ab") as stream:
+            stream.write(fixture.line(fixture.event("HIDDEN_CONTINUATION")))
+            stream.write(fixture.line(fixture.event("VISIBLE_AFTER", uuid="next")))
+        second = self.read(cursor=first["cursor"])
+        self.assertEqual(["VISIBLE_AFTER"], [e["text"] for e in second["events"]])
+        self.assertNotIn("HIDDEN_CONTINUATION", json.dumps(second))
+        self.assertTrue(second["gaps"][0]["record_complete"])
+
     def test_tail_inside_large_record_reports_gap_and_finds_later_event(self):
         self.transcript.write_bytes(fixture.line(fixture.event("x" * (mod.MAX_SCAN * 2))) + fixture.line(fixture.event("last")))
         result = self.read()
