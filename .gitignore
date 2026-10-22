@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+state/
+*.sqlite3*
+*.sock
+*.jsonl
+*.log
+.env
+.env.*
