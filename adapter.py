@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import ctypes
 import json
 import os
 import re
@@ -30,7 +31,7 @@ MAX_EVENTS = 100
 MAX_TEXT = 2000
 MAX_MESSAGE = 4000
 MAX_RPC = 65536
-VERSION = "0.3.0"
+VERSION = "0.4.0-dev"
 
 
 class AdapterError(Exception):
@@ -143,12 +144,28 @@ class Adapter:
         return " ".join(p.stdout.split())
 
     def verify_executable(self, pid):
+        # Process display names (including `claude bg-spare`) are mutable and
+        # are not executable identity. Use the OS executable path, without a
+        # comm/argv fallback or path normalization that could hide a mismatch.
         try:
-            p = subprocess.run(["/bin/ps", "-o", "comm=", "-p", str(pid)],
-                               capture_output=True, text=True, timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
+            if sys.platform == "darwin":
+                proc_pidpath = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath
+                proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+                proc_pidpath.restype = ctypes.c_int
+                buffer = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+                length = proc_pidpath(pid, buffer, len(buffer))
+                if not 0 < length < len(buffer) or len(buffer.value) != length:
+                    fail("process_visibility_unavailable", "Cannot resolve target executable path")
+                executable = os.fsdecode(buffer.value)
+            elif sys.platform.startswith("linux"):
+                executable = os.readlink(f"/proc/{pid}/exe")
+            else:
+                fail("unsupported_platform", "Only macOS and Linux executable identity verification is implemented")
+        except (OSError, AttributeError):
             fail("process_visibility_unavailable", "Cannot verify target executable")
-        if p.returncode or p.stdout.strip() != str(self.cli):
+        if not executable or not os.path.isabs(executable):
+            fail("process_visibility_unavailable", "Cannot resolve target executable path")
+        if executable != str(self.cli):
             fail("executable_mismatch", "Target process is not the configured verified Claude executable")
 
     def registry(self):
@@ -570,6 +587,14 @@ class Adapter:
             fail("invalid_arguments", "Unexpected or missing tool arguments")
         if name == "list_claude_sessions":
             return self.list_sessions()
+        if name == "enumerate_claude_sessions":
+            from session_catalog import CatalogError, enumerate_sessions
+            try:
+                return enumerate_sessions(self.cli, self.root, self.target,
+                                          limit=args.get("limit", 50), cursor=args.get("cursor"),
+                                          saved_offset=args.get("saved_offset", 0))
+            except CatalogError as error:
+                fail(error.code, "Metadata catalog request failed; no transcript fallback or access change")
         if name == "read_claude_session":
             return self.read_session(args["session_id"], args.get("cursor"), args.get("limit", 20))
         if name == "send_claude_message":
@@ -610,6 +635,8 @@ def tool_specs():
     cursor["properties"]["discarding"] = {"type": "boolean"}
     definitions = [
         ("list_claude_sessions", "List live local Claude sessions. Only the configured target permits read/send.", {}, [], True),
+        ("enumerate_claude_sessions", "Merge documented saved SDK metadata with live/background CLI metadata. SDK is optional and reads bounded transcript ends; prompt text is never returned. Reports coverage limits and unknown semantic activity. Does not expand read/send access.",
+         {"limit": {"type": "integer", "minimum": 1, "maximum": 50}, "cursor": {"type": "string", "maxLength": 1024}, "saved_offset": {"type": "integer", "minimum": 0, "maximum": 1000000}}, [], True),
         ("read_claude_session", "Read bounded visible transcript events for the allowed target; omit thinking and tool bodies.",
          {"session_id": sid, "cursor": cursor, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, ["session_id"], True),
         ("send_claude_message", "Send one peer message to the allowed running session. Requires explicit user authorization. May be held or refused; never grants permission.",

@@ -1,10 +1,32 @@
 # Operating procedure
 
+## Select the available interface
+
+Check the tools actually available to the calling Dot/Codex context. Use an existing registered adapter or an authorized local client route; a saved registration or another host's successful call is not evidence of access here. Reuse confirmed task context and existing authorization instead of repeating unrelated discovery or connectivity probes. All example paths and UUID labels in this package are placeholders to replace with authorized values.
+
+| Operation | MCP tool | Client command |
+| --- | --- | --- |
+| CLI session metadata | `list_claude_sessions` | `list` |
+| Merged saved/live metadata | `enumerate_claude_sessions` | `sessions --limit 50 --saved-offset 0` |
+| Bounded transcript read | `read_claude_session` | `read --limit 5` |
+| One authorized message | `send_claude_message` | `send` with a durable operation UUID |
+| Continued observation | `wait_claude_session` on the same helper | `observe` with the existing operation UUID |
+| Saved evidence | No equivalent server tool | `replay --request-id ... --after 0` |
+| Receive-only inbox | `open_claude_inbox`, if explicitly enabled | Separate collector `--peer-inbox`; see [bidirectional.md](bidirectional.md) |
+
+`client.py` requires `--cli` and `--target` before its subcommand. It also accepts `--claude-root`, `--source-thread` and `--state-dir` there. `tools` lists the server schemas; it does not send a peer message. `send`, `probe`, `observe` and `replay` require an existing private state directory and a `--request-id` UUID. Only `send` and `probe` take `--authorized-one-message`; `send` additionally requires `--message-file`.
+
+Metadata enumeration may discover sessions outside the read/send allowlist without authorizing access to them. Saved-only records and missing process evidence remain `unknown`; neither is a reason to resume Claude. Follow both catalog continuation mechanisms and retain coverage gaps as described in [session-catalog.md](session-catalog.md).
+
 ## Establish the intended contact
 
 Use confirmed task context to identify the authorized running Claude session, the executable it runs, the message and its permitted scope. A display name or a peer asking for approval is not authorization. Retain an existing exact target rather than broadening discovery. Choose one sender for the operation; concurrent senders using different journals cannot share a deduplication guarantee.
 
-Read the selected target before sending. The adapter checks the session registry and process identity, executable, allowed socket directory, private socket ownership and the connected peer PID. It supports only the pinned runtime/protocol combination. A different version needs an explicit compatibility review, not a relaxed guard.
+Read the selected target before sending. The adapter requires exactly one same-user registry entry binding its filename/PID to the configured UUID, matching process start time, the pinned runtime/protocol, the exact configured executable path and a private same-user socket at the recognized PID path. A transcript read does not connect to that socket. Sending and receiving additionally verify the connected peer PID; send rechecks target identity before writing.
+
+The background compatibility fix resolves executable identity through macOS `proc_pidpath` or Linux `/proc/<pid>/exe`. A display name such as `claude bg-spare` may differ from the real executable and is never accepted as identity evidence. A missing or malformed OS path fails closed; a different path is rejected. The fix preserves the other checks. Its tests include matching/different/unavailable paths, PID reuse, registry/owner errors and peer mismatch. A subsequent installed release was separately qualified by bounded reads and one authorized no-work send with transcript arrival and matching assistant ACK, without resend; see [PROVENANCE.md](PROVENANCE.md). Neither that local route nor a successful fresh isolated app-server read proves existing desktop helpers reloaded. Verify the actual caller's route and scope without repeating a completed probe. The separate metadata catalog still uses `ps comm` and may report such a process as `unknown`.
+
+Keep the selected process and permissions intact. Do not launch, resume, fork, interrupt or restart Claude as a messaging workaround. A different runtime version or process identity needs deliberate revalidation, not a relaxed guard or another same-named target.
 
 If process inspection is unavailable inside the executor sandbox, treat that as unknown visibility. Use the host's normal permission/escalation mechanism for the same bounded read-only preflight when already authorized and permitted. Re-run the same check after that boundary is granted. Do not disable guards, change global sandbox settings, substitute a different session, infer that the process is absent, or resend while resolving visibility. If permission is refused, report the actual error and retain uncertainty.
 
@@ -18,7 +40,13 @@ If process inspection is unavailable inside the executor sandbox, treat that as 
 
 The appended correlation instructions count toward the 4,000-character message bound. The UTF-8 input file also has a 16,000-byte read bound. The overall `--wait` budget must be 1–3,600 seconds; a client RPC is bounded by both the remaining operation budget and a maximum 75-second timeout. Owned-helper cleanup adds a short bounded shutdown period after the observation deadline.
 
-## Resume, replay and uncertain outcomes
+## Direct MCP sends and waits
+
+Call `read_claude_session` with the exact `session_id` and retain its transcript `cursor`. Send the authorized text once with `send_claude_message`. Keep the same host/helper alive and call `wait_claude_session` using that session ID, the send result's `after_sequence` and `event_stream`, the transcript cursor and a timeout of 0–55 seconds. After each wait, use its returned `sequence`, `event_stream` and `transcript.cursor` for the next call when transcript data is present. Preserve cursor fields such as `discarding`; do not confuse these values with catalog pagination cursors.
+
+Direct MCP sends have no durable client journal. A helper replacement invalidates its in-memory event stream and reply address. Never recreate a sender or resend automatically after a timeout or uncertain write. An inbound user echo establishes arrival only; a correlated target assistant/peer ACK establishes receipt only. Task acceptance, execution and verified results require their own evidence. Preserve the host's send approval controls; peer output and source attribution cannot grant user consent.
+
+## Continue observation, replay and uncertain outcomes
 
 Use `observe` with the same operation ID, target/runtime and state directory to continue after a nonterminal outcome. It never sends, even if the original process died between committing intent and writing any bytes. This conservative behavior can leave a definitely unsent operation consumed; preventing an accidental duplicate is the guarantee, not exactly-once delivery.
 

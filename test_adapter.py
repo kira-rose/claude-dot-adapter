@@ -5,15 +5,18 @@ Run from this directory: python3 -B -m unittest discover -s . -p test_adapter.py
 from __future__ import annotations
 
 import importlib.util
+from contextlib import contextmanager
 import io
 import json
 import os
 from pathlib import Path
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -115,6 +118,177 @@ class AdapterTests(unittest.TestCase):
              mock.patch.object(mod.socket, "socket", return_value=sock), \
              mock.patch.object(mod, "peer_pid", return_value=self.data["pid"] if pid is None else pid):
             return self.adapter.send_message(TARGET, text), sock
+
+    @contextmanager
+    def background_identity(self):
+        """Synthetic official background peer; never inspect or contact Claude."""
+        self.adapter.cli = Path("/Applications/Claude.app/Contents/MacOS/claude")
+        self.data["messagingSocketPath"] = f"/tmp/cc-socks/{self.data['pid']}.sock"
+        registry = self.root / "sessions" / f"{self.data['pid']}.json"
+        registry.write_text(json.dumps(self.data))
+        socket_path = Path(self.data["messagingSocketPath"])
+        socket_info = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=os.getuid())
+        real_lstat, real_owned_dir = Path.lstat, mod.owned_dir
+        def lstat(path, *args, **kwargs):
+            return socket_info if path == socket_path else real_lstat(path, *args, **kwargs)
+        def owned_dir(path):
+            if path != socket_path.parent:
+                real_owned_dir(path)
+        def pidpath(pid, buffer, size):
+            self.assertEqual(self.data["pid"], pid)
+            self.assertEqual(4096, size)
+            buffer.value = os.fsencode(self.adapter.cli)
+            return len(buffer.value)
+        library = mock.Mock()
+        library.proc_pidpath.side_effect = pidpath
+        display_name = subprocess.CompletedProcess([], 0, stdout="claude bg-spare\n")
+        with mock.patch.object(mod.sys, "platform", "darwin"), \
+             mock.patch.object(mod.ctypes, "CDLL", return_value=library), \
+             mock.patch.object(mod.subprocess, "run", return_value=display_name) as ps, \
+             mock.patch.object(self.adapter, "process_start", return_value=self.data["procStart"]) as start, \
+             mock.patch.object(mod, "owned_dir", side_effect=owned_dir), \
+             mock.patch.object(Path, "lstat", lstat):
+            yield SimpleNamespace(library=library, ps=ps, start=start,
+                                  registry=registry, socket_info=socket_info)
+
+    def test_background_display_name_differs_but_os_executable_matches(self):
+        with self.background_identity() as fixture:
+            self.assertEqual(self.data, self.adapter.verify_target(pin=True))
+            self.assertEqual(self.adapter.identity(self.data), self.adapter.pinned)
+            fixture.ps.assert_not_called()
+            self.assertEqual(1, fixture.library.proc_pidpath.call_count)
+
+    def test_darwin_mismatched_executable_rejected_even_if_display_name_matches(self):
+        with self.background_identity() as fixture:
+            fixture.ps.return_value.stdout = str(self.adapter.cli)
+            def wrong_path(pid, buffer, size):
+                buffer.value = b"/untrusted/claude"
+                return len(buffer.value)
+            fixture.library.proc_pidpath.side_effect = wrong_path
+            self.assert_code("executable_mismatch", self.adapter.verify_target)
+            fixture.ps.assert_not_called()
+
+    def test_darwin_failed_truncated_or_inconsistent_path_fails_closed(self):
+        cases = [(b"", 0), (b"", -1), (b"/claude", 4096), (b"/claude", 4097),
+                 (b"/claude", 6), (b"/claude\0suffix", 14),
+                 (b"x" * 4096, 4095), (b"claude", 6)]
+        for value, length in cases:
+            with self.subTest(value=value[:30], length=length), self.background_identity() as fixture:
+                def broken_path(pid, buffer, size):
+                    buffer.raw = value.ljust(size, b"\0")
+                    return length
+                fixture.library.proc_pidpath.side_effect = broken_path
+                self.assert_code("process_visibility_unavailable", self.adapter.verify_target)
+                fixture.ps.assert_not_called()
+
+    def test_darwin_library_symbol_or_call_unavailable_fails_closed(self):
+        for error in (OSError("unavailable"), AttributeError("missing symbol")):
+            with self.subTest(error=type(error).__name__), self.background_identity() as fixture, \
+                 mock.patch.object(mod.ctypes, "CDLL", side_effect=error):
+                self.assert_code("process_visibility_unavailable", self.adapter.verify_target)
+                fixture.ps.assert_not_called()
+        with self.background_identity() as fixture:
+            fixture.library.proc_pidpath.side_effect = PermissionError("denied")
+            self.assert_code("process_visibility_unavailable", self.adapter.verify_target)
+            fixture.ps.assert_not_called()
+
+    def test_linux_uses_exact_proc_executable_without_display_name_fallback(self):
+        for path, code in ((str(self.adapter.cli), None), ("/untrusted/claude", "executable_mismatch"),
+                           (str(self.adapter.cli) + " (deleted)", "executable_mismatch"),
+                           ("", "process_visibility_unavailable"), ("claude", "process_visibility_unavailable")):
+            with self.subTest(path=path), mock.patch.object(mod.sys, "platform", "linux"), \
+                 mock.patch.object(mod.os, "readlink", return_value=path) as readlink, \
+                 mock.patch.object(mod.subprocess, "run") as ps:
+                if code:
+                    self.assert_code(code, self.adapter.verify_executable, self.data["pid"])
+                else:
+                    self.adapter.verify_executable(self.data["pid"])
+                readlink.assert_called_once_with(f"/proc/{self.data['pid']}/exe")
+                ps.assert_not_called()
+
+    def test_linux_unavailable_executable_fails_closed(self):
+        for error in (FileNotFoundError("exited"), PermissionError("denied")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(mod.sys, "platform", "linux"), \
+                 mock.patch.object(mod.os, "readlink", side_effect=error), \
+                 mock.patch.object(mod.subprocess, "run") as ps:
+                self.assert_code("process_visibility_unavailable", self.adapter.verify_executable, self.data["pid"])
+                ps.assert_not_called()
+
+    def test_executable_identity_fails_closed_on_unsupported_platform(self):
+        with mock.patch.object(mod.sys, "platform", "unsupported"), mock.patch.object(mod.subprocess, "run") as ps:
+            self.assert_code("unsupported_platform", self.adapter.verify_executable, self.data["pid"])
+            ps.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin" or sys.platform.startswith("linux"), "OS path API required")
+    def test_native_executable_api_resolves_only_this_owned_python_process(self):
+        self.adapter.verify_executable(os.getpid())
+
+    def test_background_pid_reuse_rejected_before_executable_lookup(self):
+        with self.background_identity() as fixture:
+            fixture.start.return_value = "replacement-start"
+            self.assert_code("process_identity_changed", self.adapter.verify_target)
+            fixture.library.proc_pidpath.assert_not_called()
+
+    def test_background_wrong_registry_session_or_filename_mapping_rejected(self):
+        for change, code in (({"sessionId": OTHER}, "target_not_unique"),
+                             ({"pid": self.data["pid"] + 1}, "registry_identity_mismatch")):
+            with self.subTest(change=change), self.background_identity() as fixture:
+                fixture.registry.write_text(json.dumps({**self.data, **change}))
+                self.assert_code(code, self.adapter.verify_target)
+                fixture.library.proc_pidpath.assert_not_called()
+
+    def test_background_wrong_registry_owner_rejected(self):
+        real_fstat = os.fstat
+        def wrong_owner(fd):
+            values = list(real_fstat(fd))
+            values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        with self.background_identity() as fixture, mock.patch.object(mod.os, "fstat", side_effect=wrong_owner):
+            self.assert_code("target_not_unique", self.adapter.verify_target)
+            fixture.library.proc_pidpath.assert_not_called()
+
+    def test_background_socket_owner_type_and_permissions_still_required(self):
+        for mode, uid in ((stat.S_IFSOCK | 0o600, os.getuid() + 1),
+                          (stat.S_IFSOCK | 0o666, os.getuid()), (stat.S_IFREG | 0o600, os.getuid())):
+            with self.subTest(mode=mode, uid=uid), self.background_identity() as fixture:
+                fixture.socket_info.st_mode, fixture.socket_info.st_uid = mode, uid
+                self.assert_code("unsafe_socket", self.adapter.verify_target)
+
+    def test_background_socket_path_binding_still_required(self):
+        for path in ("/tmp/untrusted/424242.sock", "/tmp/cc-socks/999.sock"):
+            with self.subTest(path=path), self.background_identity() as fixture:
+                fixture.registry.write_text(json.dumps({**self.data, "messagingSocketPath": path}))
+                self.assert_code("unsafe_socket_path", self.adapter.verify_target)
+
+    def test_background_socket_peer_mismatch_or_post_connect_pid_reuse_prevents_write(self):
+        for reused, code in ((False, "socket_peer_changed"), (True, "process_identity_changed")):
+            sock = FakeSocket()
+            with self.subTest(reused=reused), self.background_identity() as fixture, \
+                 mock.patch.object(self.adapter, "start_inbox"), \
+                 mock.patch.object(mod.socket, "socket", return_value=sock), \
+                 mock.patch.object(mod, "peer_pid", return_value=self.data["pid"] if reused else self.data["pid"] + 1):
+                if reused:
+                    fixture.start.side_effect = [self.data["procStart"], "replacement-start"]
+                self.assert_code(code, self.adapter.send_message, TARGET, "Synthetic test only")
+                self.assertEqual(b"", sock.written)
+                self.assertEqual({}, self.adapter.outstanding)
+
+    def test_background_executable_mismatch_prevents_socket_creation(self):
+        with self.background_identity() as fixture, mock.patch.object(mod.socket, "socket") as socket_factory:
+            def wrong_path(pid, buffer, size):
+                buffer.value = b"/untrusted/claude"
+                return len(buffer.value)
+            fixture.library.proc_pidpath.side_effect = wrong_path
+            self.assert_code("executable_mismatch", self.adapter.send_message, TARGET, "Synthetic test only")
+            socket_factory.assert_not_called()
+            self.assertEqual({}, self.adapter.outstanding)
+
+    def test_linux_socket_peer_owned_by_other_user_rejected(self):
+        sock = mock.Mock()
+        sock.getsockopt.return_value = mod.struct.pack("3i", self.data["pid"], os.getuid() + 1, 0)
+        with mock.patch.object(mod.sys, "platform", "linux"), \
+             mock.patch.object(mod.socket, "SO_PEERCRED", 17, create=True):
+            self.assert_code("wrong_peer_uid", mod.peer_pid, sock)
 
     def test_uuid_validation_rejects_paths_and_non_strings(self):
         for value in ("../settings.json", str(self.transcript), TARGET.upper().replace("1", "A", 1), None, [], {}):

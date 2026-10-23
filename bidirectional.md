@@ -1,6 +1,6 @@
 # Receive-only event collection
 
-The 0.3.0 candidate provides a portable local collector. It can observe a selected running Claude session's assistant transcript and optionally receive unsolicited peer messages. It journals those observations without first sending a message. It does not wake Codex, announce itself to Claude, launch a daemon or install a scheduled service.
+The portable local collector introduced in 0.3.0 remains part of 0.4.0-dev. It can observe a selected running Claude session's assistant transcript and optionally receive unsolicited peer messages. It journals those observations without first sending a message. It does not wake Codex, announce itself to Claude, launch a daemon or install a scheduled service.
 
 ## Run and inspect
 

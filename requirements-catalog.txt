@@ -1,0 +1,2 @@
+# Optional saved-session metadata only; requires a separately reviewed installation.
+claude-agent-sdk==0.2.172

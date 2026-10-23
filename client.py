@@ -38,7 +38,7 @@ class Client:
         try:
             self._configure_transport()
             self.request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
-                         "clientInfo": {"name": "claude-adapter-client", "version": "0.3.0"}})
+                         "clientInfo": {"name": "claude-adapter-client", "version": "0.4.0-dev"}})
             self._write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode() + b"\n",
                         time.monotonic() + self.timeout, self.cancel)
         except BaseException:
@@ -160,6 +160,10 @@ def main():
     parser.add_argument("--state-dir", help="Existing private 0700 directory; required for durable operations")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list")
+    sessions = sub.add_parser("sessions", help="Metadata catalog with explicit saved-history limits")
+    sessions.add_argument("--limit", type=int, default=50)
+    sessions.add_argument("--cursor")
+    sessions.add_argument("--saved-offset", type=int, default=0)
     sub.add_parser("tools")
     read = sub.add_parser("read")
     read.add_argument("--limit", type=int, default=5)
@@ -227,6 +231,11 @@ def main():
                     emit(client.request("tools/list", {}))
                 elif args.command == "list":
                     emit(client.call("list_claude_sessions", {}))
+                elif args.command == "sessions":
+                    call = {"limit": args.limit, "saved_offset": args.saved_offset}
+                    if args.cursor is not None:
+                        call["cursor"] = args.cursor
+                    emit(client.call("enumerate_claude_sessions", call))
                 else:
                     call = {"session_id": args.target, "limit": args.limit}
                     if args.cursor:
