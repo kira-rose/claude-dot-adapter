@@ -32,6 +32,11 @@ MAX_TEXT = 2000
 MAX_MESSAGE = 4000
 MAX_RPC = 65536
 VERSION = "0.4.0-dev"
+QUALIFIED_PEERS = frozenset({
+    ("darwin", "2.1.299", 1),
+    ("linux", "2.1.299", 1),
+    ("darwin", "2.1.308", 1),
+})
 
 
 class AdapterError(Exception):
@@ -197,10 +202,13 @@ class Adapter:
 
     def verify_target(self, *, pin=False):
         d = self.registry()
-        if type(d.get("pid")) is not int or d["pid"] <= 1:
+        if type(d.get("pid")) is not int or not 2 <= d["pid"] <= 2**31 - 1:
             fail("invalid_pid", "Invalid target process ID")
-        if d.get("version") != "2.1.299" or d.get("peerProtocol") != 1:
-            fail("unsupported_protocol", "This adapter is verified only for Claude Code 2.1.299 / peer protocol 1")
+        version, protocol = d.get("version"), d.get("peerProtocol")
+        platform = "linux" if sys.platform.startswith("linux") else sys.platform
+        if (type(version) is not str or type(protocol) is not int or
+                (platform, version, protocol) not in QUALIFIED_PEERS):
+            fail("unsupported_protocol", "Qualified peers: Claude Code 2.1.299 on macOS/Linux or 2.1.308 on macOS; peer protocol 1 only")
         if not isinstance(d.get("procStart"), str) or self.process_start(d["pid"]) != " ".join(d["procStart"].split()):
             fail("process_identity_changed", "Target PID does not match the registered process start time")
         self.verify_executable(d["pid"])

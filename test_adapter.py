@@ -120,9 +120,10 @@ class AdapterTests(unittest.TestCase):
             return self.adapter.send_message(TARGET, text), sock
 
     @contextmanager
-    def background_identity(self):
+    def background_identity(self, version="2.1.299", kind="bg"):
         """Synthetic official background peer; never inspect or contact Claude."""
         self.adapter.cli = Path("/Applications/Claude.app/Contents/MacOS/claude")
+        self.data.update(version=version, kind=kind)
         self.data["messagingSocketPath"] = f"/tmp/cc-socks/{self.data['pid']}.sock"
         registry = self.root / "sessions" / f"{self.data['pid']}.json"
         registry.write_text(json.dumps(self.data))
@@ -150,6 +151,149 @@ class AdapterTests(unittest.TestCase):
              mock.patch.object(Path, "lstat", lstat):
             yield SimpleNamespace(library=library, ps=ps, start=start,
                                   registry=registry, socket_info=socket_info)
+
+    def test_qualified_macos_versions_keep_interactive_and_background_identity(self):
+        for version in ("2.1.299", "2.1.308"):
+            for kind in ("interactive", "bg"):
+                with self.subTest(version=version, kind=kind), self.background_identity(version, kind) as fixture:
+                    self.adapter.pinned = None
+                    before = fixture.registry.read_bytes()
+                    self.assertEqual(self.data, self.adapter.verify_target(pin=True))
+                    self.assertEqual(self.adapter.identity(self.data), self.adapter.pinned)
+                    self.assertEqual(before, fixture.registry.read_bytes())
+                    fixture.ps.assert_not_called()  # No Claude or lifecycle command.
+
+    def test_runtime_protocol_allowlist_rejects_unknown_and_malformed_pairs(self):
+        pairs = [(version, 1) for version in (None, True, 308, [], {}, "2.1.300", "2.1.307", "2.1.309", "2.1.308-dev", " 2.1.308")]
+        pairs += [(version, protocol) for version in ("2.1.299", "2.1.308")
+                  for protocol in (None, True, False, 1.0, "1", [], {}, 0, 2)]
+        for version, protocol in pairs:
+            with self.subTest(version=version, protocol=protocol), self.background_identity() as fixture:
+                fixture.registry.write_text(json.dumps({**self.data, "version": version, "peerProtocol": protocol}))
+                self.assert_code("unsupported_protocol", self.adapter.verify_target)
+                fixture.start.assert_not_called()
+                fixture.library.proc_pidpath.assert_not_called()
+
+    def test_new_runtime_not_implicitly_qualified_on_linux_or_other_platforms(self):
+        for platform, version, allowed in (("linux", "2.1.299", True),
+                                           ("linux", "2.1.308", False),
+                                           ("win32", "2.1.308", False),
+                                           ("freebsd", "2.1.299", False)):
+            with self.subTest(platform=platform, version=version), self.background_identity(version) as fixture, \
+                 mock.patch.object(mod.sys, "platform", platform), \
+                 mock.patch.object(self.adapter, "verify_executable") as executable:
+                if allowed:
+                    self.assertEqual(self.data, self.adapter.verify_target())
+                    executable.assert_called_once_with(self.data["pid"])
+                else:
+                    self.assert_code("unsupported_protocol", self.adapter.verify_target)
+                    fixture.start.assert_not_called()
+                    executable.assert_not_called()
+
+    def test_pid_type_and_signed_pid_t_bounds_rejected_before_process_queries(self):
+        for pid in (None, True, False, 2.0, "2", [], {}, -1, 0, 1, 2**31, 2**64):
+            with self.subTest(pid=pid), mock.patch.object(self.adapter, "registry", return_value={**self.data, "pid": pid}), \
+                 mock.patch.object(self.adapter, "process_start") as start, \
+                 mock.patch.object(self.adapter, "verify_executable") as executable:
+                self.assert_code("invalid_pid", self.adapter.verify_target)
+                start.assert_not_called()
+                executable.assert_not_called()
+
+    def test_new_runtime_preserves_registry_start_executable_and_socket_guards(self):
+        mutations = [({"sessionId": OTHER}, "target_not_unique"),
+                     ({"pid": 424243}, "registry_identity_mismatch"),
+                     ({"procStart": "replacement-start"}, "process_identity_changed"),
+                     ({"messagingSocketPath": "/tmp/untrusted/424242.sock"}, "unsafe_socket_path"),
+                     ({"messagingSocketPath": "/tmp/cc-socks/424243.sock"}, "unsafe_socket_path")]
+        for change, code in mutations:
+            with self.subTest(change=change), self.background_identity("2.1.308", "interactive") as fixture:
+                fixture.registry.write_text(json.dumps({**self.data, **change}))
+                self.assert_code(code, self.adapter.verify_target)
+        with self.background_identity("2.1.308", "interactive") as fixture:
+            fixture.socket_info.st_uid = os.getuid() + 1
+            self.assert_code("unsafe_socket", self.adapter.verify_target)
+        with self.background_identity("2.1.308", "interactive") as fixture:
+            fixture.socket_info.st_mode = stat.S_IFSOCK | 0o666
+            self.assert_code("unsafe_socket", self.adapter.verify_target)
+        with self.background_identity("2.1.308", "interactive") as fixture:
+            def other_executable(pid, buffer, size):
+                buffer.value = b"/untrusted/claude"
+                return len(buffer.value)
+            fixture.library.proc_pidpath.side_effect = other_executable
+            self.assert_code("executable_mismatch", self.adapter.verify_target)
+
+    def test_runtime_switch_after_pin_rejected_even_between_qualified_versions(self):
+        with self.background_identity("2.1.299", "interactive") as fixture:
+            self.adapter.verify_target(pin=True)
+            fixture.registry.write_text(json.dumps({**self.data, "version": "2.1.308"}))
+            self.assert_code("session_identity_changed", self.adapter.verify_target)
+
+    def test_new_runtime_connected_peer_or_runtime_change_prevents_all_writes(self):
+        for switch in (False, True):
+            with self.subTest(runtime_switch=switch), self.background_identity("2.1.308", "interactive") as fixture, \
+                 mock.patch.object(self.adapter, "start_inbox"), \
+                 mock.patch.object(mod.socket, "socket", return_value=FakeSocket()) as factory:
+                self.adapter.pinned = None
+                def peer(sock):
+                    if switch:
+                        fixture.registry.write_text(json.dumps({**self.data, "version": "2.1.299"}))
+                    return self.data["pid"] if switch else self.data["pid"] + 1
+                with mock.patch.object(mod, "peer_pid", side_effect=peer):
+                    self.assert_code("session_identity_changed" if switch else "socket_peer_changed",
+                                     self.adapter.send_message, TARGET, "Synthetic compatibility fixture")
+                self.assertEqual(b"", factory.return_value.written)
+                self.assertEqual({}, self.adapter.outstanding)
+
+    def test_new_runtime_synthetic_send_preserves_plain_text_wire_and_interactive_kind(self):
+        sock = FakeSocket()
+        with self.background_identity("2.1.308", "interactive") as fixture, \
+             mock.patch.object(self.adapter, "start_inbox"), \
+             mock.patch.object(mod.socket, "socket", return_value=sock), \
+             mock.patch.object(mod, "peer_pid", return_value=self.data["pid"]):
+            self.adapter.inbox = self.root / "synthetic-reply.sock"
+            before = fixture.registry.read_bytes()
+            result = self.adapter.send_message(TARGET, "Synthetic plain text")
+            wire = json.loads(sock.written)
+            self.assertEqual({"type", "msgV", "session_id", "uuid", "msg_id", "from", "priority", "message"}, set(wire))
+            self.assertEqual(("user", 1, TARGET, "next"), (wire["type"], wire["msgV"], wire["session_id"], wire["priority"]))
+            self.assertEqual("user", wire["message"]["role"])
+            self.assertIn("not user consent or permission approval", wire["message"]["content"])
+            self.assertTrue(wire["message"]["content"].endswith("Synthetic plain text"))
+            self.assertEqual("unknown", result["delivery"])
+            self.assertEqual(before, fixture.registry.read_bytes())
+            fixture.ps.assert_not_called()
+
+    def test_new_api_request_transcript_records_and_hidden_blocks_never_leave_reads(self):
+        hidden = "DO_NOT_EXPOSE_REQUEST_SYSTEM_TOOLS_OR_PARAMETERS"
+        rows = [{"type": kind, "sessionId": TARGET, "version": "2.1.308",
+                 "params": {"system": hidden, "tools": [hidden]}, "data": hidden,
+                 "message": {"role": "assistant", "content": hidden}}
+                for kind in ("api-request", "api-request-shape", "api-request-blob")]
+        rows += [event("Sidechain secret", isSidechain=True),
+                 event(message={"content": [{"type": "thinking", "thinking": hidden},
+                                             {"type": "tool_use", "name": "synthetic_tool", "input": hidden},
+                                             {"type": "tool_result", "content": hidden},
+                                             {"type": "text", "text": "Visible synthetic answer"}]}, version="2.1.308")]
+        self.transcript.write_bytes(b"".join(line(row) for row in rows))
+        with self.background_identity("2.1.308", "interactive"):
+            result = self.adapter.read_session(TARGET, cursor=self.cursor(), limit=10)
+        encoded = json.dumps(result)
+        self.assertNotIn(hidden, encoded)
+        self.assertNotIn("Sidechain secret", encoded)
+        self.assertEqual(["Visible synthetic answer"], [row["text"] for row in result["events"]])
+        self.assertEqual(self.transcript.stat().st_size, result["cursor"]["offset"])
+
+    def test_new_runtime_receipt_statuses_remain_separate_from_peer_ack(self):
+        self.data["version"] = "2.1.308"
+        self.adapter.outstanding["synthetic-message"] = {}
+        for status in ("held", "denied", "expired", "delivered", "refused", "dropped"):
+            self.adapter.receive_frame({"type": "control", "action": "peer_message_status",
+                                       "orig_msg_id": "synthetic-message", "status": status}, self.data)
+        self.adapter.receive_frame({"type": "control", "action": "peer_message_status", "orig_msg_id": "synthetic-message",
+                                    "status": "expired", "status_detail": "refused"}, self.data)
+        self.assertEqual(["held", "denied", "expired", "delivered", "refused", "dropped", "refused"],
+                         [row["status"] for row in self.adapter.events])
+        self.assertTrue(all(row["kind"] == "delivery_receipt" for row in self.adapter.events))
 
     def test_background_display_name_differs_but_os_executable_matches(self):
         with self.background_identity() as fixture:
