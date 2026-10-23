@@ -567,6 +567,7 @@ class Adapter:
         if after_sequence > self.seq:
             fail("invalid_event_cursor", "Sequence is ahead of this helper")
         deadline = time.monotonic() + timeout
+        read, first = None, True
         while True:
             with self.changed:
                 found = [e for e in self.events if e["sequence"] > after_sequence]
@@ -574,13 +575,20 @@ class Adapter:
                 oldest = self.events[0]["sequence"] if self.events else self.seq + 1
                 event_gap = ({"after_sequence": after_sequence, "oldest_available": oldest}
                              if after_sequence < oldest - 1 else None)
-            read = self.read_session(sid, cursor, 20) if cursor is not None else None
-            if found or event_gap or self.stopping.is_set() or (read and (read["events"] or read.get("gaps") or read["cursor"] != cursor)) or time.monotonic() >= deadline:
+            # Always permit one zero-time poll, but never begin another scan
+            # after a long-poll deadline. Verification still gates the result.
+            if first or time.monotonic() < deadline:
+                read = self.read_session(sid, cursor, 20) if cursor is not None else None
+            first = False
+            transcript_progress = bool(read and (read["events"] or read.get("gaps") or read["cursor"] != cursor))
+            progress = bool(found or event_gap or transcript_progress)
+            if progress or self.stopping.is_set() or time.monotonic() >= deadline:
                 d = self.verify_target()
                 return {"session_id": sid, "status": d.get("status"), "waiting_for": d.get("waitingFor"),
                         "events": found, "sequence": snapshot_sequence, "event_stream": self.stream_id,
                         "event_gap": event_gap, "cancelled": self.stopping.is_set(), "transcript": read,
-                        "timed_out": not found and not (read and read["events"])}
+                        "timed_out": not progress and not self.stopping.is_set() and time.monotonic() >= deadline,
+                        "progress": progress}
             with self.changed:
                 self.changed.wait(min(1, max(0, deadline - time.monotonic())))
 

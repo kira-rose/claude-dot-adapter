@@ -8,6 +8,8 @@ Qualification recorded on 23 October 2026: an earlier catalog build was installe
 
 The macOS 2.1.308 update subsequently passed 218 tests in both source and staged isolated runtime, was installed by a guarded versioned cutover, and completed a bounded read and one authorized receipt marker through the installed local client. The matching assistant transcript ACK was observed with zero resends; the same process remained interactive. A separate native call in the existing desktop chat still returned the old 2.1.299-only guard, establishing that helper had not reloaded. Local-client qualification does not establish desktop helper activation.
 
+The subsequent observation-reliability changes are source-only fixture work. They have not been installed, published or tested against a live session. Earlier live qualification does not qualify this working revision.
+
 ## Entry points
 
 | Entry point | Purpose | Lifetime and persistence |
@@ -50,7 +52,9 @@ python3 -B client.py --cli /absolute/path/to/claude \
   --message-file /absolute/private/message.txt --wait 45
 ```
 
-The client appends a unique receipt-acknowledgement line. It keeps the same helper alive through the send and all observation polls, emitting JSON progress and one final state. An inbound user transcript echo establishes arrival only. A matching target assistant line or verified peer reply establishes acknowledgement of receipt only.
+The client appends a unique receipt-acknowledgement line. It keeps the same helper alive through the send and all observation polls, emitting bounded JSON metadata progress and a final saved-state report. An inbound user transcript echo establishes arrival only. A matching target assistant line or verified peer reply establishes acknowledgement of receipt only. Additional assistant text, including text beside the ACK, is retained as candidate evidence with unverified correlation and work completion.
+
+`send --dispatch-only` sends once, records the result and releases the workflow owner. It closes the original peer reply inbox on exit. A later observer can continue transcript reads, but cannot recover missed replies sent to that inbox. A repeated dispatch with the same UUID returns saved state without starting a helper or sending again.
 
 After timeout or helper exit, resume observation with the same identity and journal:
 
@@ -61,11 +65,15 @@ python3 -B client.py --cli /absolute/path/to/claude \
   observe --request-id stable-operation-uuid --wait 45
 ```
 
-`observe` never sends. It resumes the saved transcript cursor and records a listener gap: peer replies missed while the original helper was absent cannot be recovered. Already saved peer evidence remains replayable. A changed target identity is refused, including a replacement process using the same session UUID.
+`observe` requires an existing durable operation and never sends. It resumes the saved transcript cursor and records a listener gap: peer replies missed while the original helper was absent cannot be recovered. A new helper stream does not open a replacement reply inbox; resumed observation is labelled `transcript_only`. Already saved peer evidence remains replayable. A changed target identity is refused, including a replacement process using the same session UUID. Plain `observe` replays a saved ACK or held/refused outcome; explicit `observe --follow` continues bounded observation after it. Follow never infers completion from later text or an idle target.
 
-`replay --request-id ... --after 0` reads saved state and up to 100 saved events without starting a helper or checking live status. Continue with the last returned `ordinal`. Replay requires the matching configured target/runtime paths. A terminal duplicate `send` returns saved state with `live_check: false`; it does not make a new contact.
+`status --request-id ...` and `replay --request-id ... --after 0 --limit 100` read committed state without starting a helper, taking the workflow owner lock or checking live status. They can run while the single mutating observer owns the journal. A short snapshot releases its database read transaction before output. Hot-journal recovery, unexpected WAL state and unsafe files are refused without repair. The persistent `owner.lock` file is not proof of an active owner; the kernel lock ends when its descriptor closes. Never delete it to bypass ownership.
 
-Exit codes: `0` for acknowledged send/observe or successful read/replay; `2` for an unacknowledged, held, failed or timed-out operation; `130` for cancelled observation; `1` for other errors. JSON state is the detailed evidence. Cancelling observation stops the owned helper, not the Claude session or previously requested work.
+Durable final reports, status and replay omit message text by default. `replay --include-text` explicitly includes bounded visible text with best-effort redaction; this is not a complete secret or PII filter. Continue replay with the last returned evidence `ordinal`, not the snapshot's maximum `last_ordinal`. `replay_has_more` describes saved-event pagination; `transcript_has_more` describes the last observed transcript backlog, or is null for unknown legacy state. Preflight coverage is separate from later gap counts. These reports have `live_check: false` and unknown owner liveness: saved `running` state can survive a crash. Matching configured target/runtime paths are still required.
+
+Exit codes: `0` for acknowledged observation, successful dispatch-only or successful read/status/replay; `2` for an unacknowledged, held, failed or timed-out operation; `3` when output is unavailable; `130` for cancelled observation, including when output also fails; `1` for other errors. Follow ends at its budget with code `2` even when an earlier ACK remains saved. Cancelling observation preserves received evidence and stops the owned helper, not the Claude session or previously requested work.
+
+Blocked or broken stdout cannot hold a workflow indefinitely: each pipe-output attempt has a short deadline, and partial output disables further frames. Committed evidence remains in the journal. Ordinary progress callback failures are recorded separately and do not abort observation. Quiet progress is emitted at roughly five-second intervals when polls return. Client waits reserve response overhead inside the operation budget and do not begin a final poll after that reserve is exhausted; cleanup and filesystem latency are not a hard real-time guarantee. A client rejects overlapping RPCs before the second write.
 
 ## Register the MCP tools in Codex
 
@@ -101,6 +109,8 @@ MCP operating sequence: read once, retain the transcript cursor, send exactly on
 
 Transcript reads scan at most 256 KiB, return at most 100 events and cap visible text at 2,000 characters. Thinking, tool inputs/results and system records are omitted. Oversized records are discarded in bounded chunks with explicit byte-range gaps; partial JSON is never parsed. A cursor may carry `discarding: true` until the skipped record ends. Transcript rotation and invalid cursors fail explicitly. Bounded tail snapshots can omit earlier history and report warnings.
 
+Wait results distinguish cursor/gap progress from timeout, even when no visible event is returned. Subsequent transcript scans stop at the wait deadline; final target identity verification remains required. The reliability audit reproduced misleading timeout flags and an extra expired scan, not a completed-record cursor stall.
+
 Peer events have a separate helper-specific stream and sequence. The in-memory buffer retains 200 events and reports retention gaps. A new helper cannot replay an old stream. The journal atomically commits observed evidence with its cursors; it cannot recover events never observed. It holds at most 128 operations and 5,000 events, with a 256 KiB bound per stored JSON value. Capacity errors preserve the last committed cursor and do not silently prune deduplication state. Do not delete or replace a journal to retry an uncertain operation.
 
 The original client workflow is caller-driven bounded observation. The separate collector can remain active for its explicit foreground budget and publish newly committed envelopes to a connected pipe. Neither path provides a daemon or automatic wake-up/delivery to a disconnected Codex chat. Local output and state can contain private conversation metadata and paths: retain them privately and exclude them from source control.
@@ -111,6 +121,6 @@ The original client workflow is caller-driven bounded observation. The separate 
 python3 -B -m unittest discover -s . -p 'test*.py' -q
 ```
 
-The suite uses synthetic sessions, temporary Unix sockets and owned Python helpers. It never starts or contacts Claude or a provider. The latest local code qualification passed **218 tests on macOS with Python 3.14.7**, including 16 executable-identity regressions and 10 compatibility regressions. The 2.1.308 qualification also compared the signed installed macOS binaries' registry, transcript and plain-text inbox contracts with 2.1.299. These source and fixture checks do not establish live delivery. Linux path/peer cases were synthetic on that host, and Linux 2.1.308 remains rejected. CI is configured for Linux and macOS with Python 3.10 and 3.14; this configuration is not a passing CI result. Earlier remote runs did not execute the test jobs, and no green remote result is claimed here.
+The suite uses synthetic sessions, temporary Unix sockets and owned Python helpers. It never starts or contacts Claude or a provider. The current observation-reliability source candidate passes **247 tests on macOS with Python 3.14.7**. It has no new live qualification or installed-runtime changes. The historical installed 2.1.308 compatibility revision passed 218 tests, including 16 executable-identity regressions and 10 compatibility regressions. That earlier qualification also compared the signed installed macOS binaries' registry, transcript and plain-text inbox contracts with 2.1.299. Source and fixture checks do not establish live delivery. Linux path/peer cases were synthetic on that host, and Linux 2.1.308 remains rejected. CI is configured for Linux and macOS with Python 3.10 and 3.14; this configuration is not a passing CI result. Earlier remote runs did not execute the test jobs, and no green remote result is claimed here.
 
 See [procedure.md](procedure.md) for operation and uncertainty handling, [SECURITY.md](SECURITY.md) for trust boundaries, and [PROVENANCE.md](PROVENANCE.md) for origin and license status.

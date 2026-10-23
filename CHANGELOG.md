@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased observation reliability — source candidate, 2026-10-23
+
+- Distinguish cursor/gap progress from actual wait timeout and stop additional transcript scans after the deadline while retaining final identity verification.
+- Add concurrent read-only operation `status`/`replay`, strict snapshot privacy and recovery refusal, with distinct transcript backlog, replay pagination and saved coverage metadata.
+- Add explicit dispatch-only handoff and post-ACK/held observation follow, retaining at-most-once intent and documenting the lost original peer inbox.
+- Preserve ACK and candidate answer text independently; correlation and work completion remain unverified.
+- Bound progress pipe writes, preserve cancellation and committed evidence on output failure, and reject overlapping RPC calls before writing.
+- This work is qualified only with isolated fixtures; it has not changed the installed adapter or contacted a live Claude session.
+
 ## 0.4.0-dev — development candidate, 2026-10-23
 
 - Add metadata-only `enumerate_claude_sessions` and client `sessions`, merging stable UUIDs from documented live/background CLI and optional saved-session SDK sources.

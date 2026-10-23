@@ -121,6 +121,37 @@ class ObservationTests(unittest.TestCase):
         self.assertTrue(result["cancelled"])
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_cursor_and_gap_progress_are_not_timeouts(self):
+        for payload in (fixture.line({"type": "system", "padding": "hidden"}),
+                        fixture.line({"type": "api-request", "padding": "x" * (mod.MAX_RECORD + 5)})):
+            with self.subTest(size=len(payload)):
+                self.transcript.write_bytes(payload)
+                cursor = self.cursor()
+                with mock.patch.object(self.adapter, "verify_target", return_value=self.data):
+                    result = self.adapter.wait_session(fixture.TARGET, timeout=55, cursor=cursor)
+                self.assertGreater(result["transcript"]["cursor"]["offset"], cursor["offset"])
+                self.assertTrue(result["progress"])
+                self.assertFalse(result["timed_out"])
+                self.assertEqual([], result["transcript"]["events"])
+
+    def test_wait_does_not_rescan_after_deadline(self):
+        cursor = self.cursor()
+        now = [0.0]
+        snapshot = {"events": [], "gaps": [], "cursor": cursor}
+        def scan(*_):
+            now[0] += 0.9
+            return snapshot
+        def pause(seconds):
+            now[0] += seconds
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(self.adapter, "read_session", side_effect=scan) as read, \
+             mock.patch.object(self.adapter.changed, "wait", side_effect=pause), \
+             mock.patch.object(self.adapter, "verify_target", return_value=self.data):
+            result = self.adapter.wait_session(fixture.TARGET, timeout=1, cursor=cursor)
+        self.assertEqual(1, read.call_count)
+        self.assertTrue(result["timed_out"])
+        self.assertFalse(result["progress"])
+
 
 if __name__ == "__main__":
     unittest.main()

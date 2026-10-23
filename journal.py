@@ -122,3 +122,57 @@ class Journal:
 
     def __exit__(self, *_):
         self.close()
+
+
+class JournalReader(Journal):
+    """Existing committed state only; no owner lock, creation or recovery writes."""
+
+    def __init__(self, directory):
+        self.db = self.lock = None
+        directory = Path(directory).expanduser()
+        if directory.is_symlink():
+            raise ValueError("State directory must not be a symlink")
+        path = directory.resolve(strict=True)
+        info = path.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError("Use an existing, user-owned 0700 state directory")
+        database = path / "operations.sqlite3"
+        for item in [database] + [Path(str(database) + suffix) for suffix in ("-journal", "-wal", "-shm")]:
+            if item == database or item.exists() or item.is_symlink():
+                info = item.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise ValueError("Unsafe read-only journal file")
+                if str(item).endswith(("-wal", "-shm")):
+                    raise ValueError("Unexpected WAL state; offline journal reconciliation required")
+        try:
+            self.db = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.1)
+            self.db.execute("PRAGMA query_only=ON")
+            if self.db.execute("SELECT value FROM metadata WHERE key='version'").fetchone() != ("1",):
+                raise ValueError("Unsupported journal version")
+        except sqlite3.OperationalError as error:
+            self.close()
+            raise ValueError("Journal busy or recovery required; read-only status unavailable, no send") from error
+        except BaseException:
+            self.close()
+            raise
+
+    def begin(self, *args, **kwargs):
+        raise ValueError("Read-only journal cannot dispatch or checkpoint")
+
+    checkpoint = begin
+
+    def snapshot(self, request_id, *, after=0, limit=100):
+        # Release the read transaction before serialization/output, so a slow
+        # reporter cannot hold the workflow writer's SQLite commit lock.
+        try:
+            self.db.execute("BEGIN")
+            operation = self.get(request_id)
+            evidence = self.replay(request_id, after, limit)
+            last = self.db.execute("SELECT coalesce(max(ordinal),0) FROM events WHERE operation=?", (request_id,)).fetchone()[0]
+            return {"operation": operation, "evidence": evidence, "last_ordinal": last,
+                    "has_more": bool(last > (evidence[-1]["ordinal"] if evidence else after)),
+                    "live_check": False}
+        except sqlite3.OperationalError as error:
+            raise ValueError("Journal busy or recovery required; saved snapshot unavailable, no send") from error
+        finally:
+            self.db.rollback()

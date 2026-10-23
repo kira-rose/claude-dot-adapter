@@ -12,6 +12,8 @@ The durable workflow uses a private directory, exclusive owner lock and synchron
 
 Saved observations may contain private message text, target process metadata and filesystem paths. Protect the journal and CLI output as conversation data. Thinking and tool bodies are intentionally excluded, but the remaining text is not automatically safe to publish. Retention quotas fail explicitly; no automatic pruning, remote backup or upload is implemented.
 
+Durable workflow final reports and read-only status/replay expose metadata by default; replay text requires `--include-text` and uses best-effort redaction. Direct transcript-read commands still return visible text. Read-only snapshots do not take the sender lock, create journal files, repair hot rollback journals or establish live ownership. A stored running status may be stale. Snapshot transactions close before output so a blocked consumer cannot keep a database read lock. Bounded pipe output failures preserve committed operation evidence; they are not permission to retry a send.
+
 An ACK proves receipt only. Socket success is not delivery, delivery is not work acceptance, and a terminal result still needs independent verification when the task requires it. Transcript gaps, stream restarts, stale evidence, capacity errors and process-visibility failures must remain visible.
 
 Report defects through a private channel controlled by the repository owner. Include synthetic reproductions, source revision and bounded error details. Do not attach real transcripts, state databases, credentials or live session identifiers to a public report.
